@@ -9,12 +9,14 @@ source activate /work/nayeem/ENV/torch_cuda12
 
 import os
 import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GATv2Conv
+
 from sklearn.preprocessing import StandardScaler
 from scipy.stats import pearsonr
 import matplotlib.pyplot as plt
@@ -28,10 +30,11 @@ np.random.seed(42)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 32
 LEARNING_RATE = 0.001
-EPOCHS = 50
+WEIGHT_DECAY = 1e-4  # Regularization to prevent overfitting
+EPOCHS = 60
 SUB_IDs = ["UTS01"]  # adjust if you want more subjects
 TRs_to_remove = [1340, 2138, 2842, 2843, 3688, 8676]
-DROPOUT = 0.3 # tried= 0.3, 0.0, 0.15, and 0.45 
+DROPOUT = 0.4 # tried= 0.3, 0.0, 0.15, and 0.45 
 DATA_DIR = "/work/nayeem/Huth_deepfMRI/processed_data_transformed_atlas_float32/"
 SAVE_DIR = os.path.join(DATA_DIR, "GAT_Results_gpt")
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -42,6 +45,29 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 ####################################################################################################################################################
 ###############################################################   Classes and Functions   ##########################################################
 ####################################################################################################################################################
+# --- CUSTOM LOSS FUNCTION ---
+class NegativePearsonLoss(nn.Module):
+    """
+    Optimizes directly for Pearson Correlation.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, preds, targets):
+        # Flatten to (N,)
+        x = preds.flatten()
+        y = targets.flatten()
+        
+        # Center variables
+        vx = x - torch.mean(x)
+        vy = y - torch.mean(y)
+        
+        # Compute Correlation
+        cost = torch.sum(vx * vy) / (torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)) + 1e-8)
+        
+        # Return negative correlation (we want to minimize this)
+        return -cost
+
 # --- 1. DATA PREPARATION ---
 # --- 1. DATA PREPARATION ---
 class BrainStateDataset(Dataset):
@@ -127,10 +153,12 @@ class BrainGAT(torch.nn.Module):
         # Layer 1: Attention Layer
         # Concatenates heads: Output dim = hidden_dim * heads
         self.gat1 = GATv2Conv(in_channels, 64, heads=heads, dropout=dropout)
+        self.proj1 = nn.Linear(in_channels, 64 * heads) # Projection for skip connection
         
         # Layer 2: Attention Layer
         # Output dim = 32 * heads
         self.gat2 = GATv2Conv(64 * heads, 32, heads=heads, dropout=dropout)
+        self.proj2 = nn.Linear(64 * heads, 32 * heads)  # Projection for skip connection
         
         # Layer 3: Regression Head (Linear)
         # We aggregate head outputs and map to 1 scalar (BOLD value)
@@ -142,41 +170,30 @@ class BrainGAT(torch.nn.Module):
         x, edge_index = data.x, data.edge_index
         
         # GAT Block 1
+        identity = self.proj1(x)
         x = self.gat1(x, edge_index)
         x = F.elu(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
+        x = x + identity # Residual concat 
         
         # GAT Block 2
+        identity = self.proj2(x)
         x = self.gat2(x, edge_index)
         x = F.elu(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
+        x = x + identity # Residual concat 
         
         # Final Prediction
         x = self.fc(x)
-        
         return x
 
 # --- 3. METRICS HELPER ---
 def compute_metrics(y_pred, y_true):
-    """
-    Computes MSE, MAE, R2, and Pearson Correlation.
-    Expects inputs of shape (Batch_Size * Nodes, 1) or (Total_Nodes, 1)
-    """
     y_pred = y_pred.detach().cpu().numpy().flatten()
     y_true = y_true.detach().cpu().numpy().flatten()
-    
     mse = np.mean((y_true - y_pred)**2)
-    mae = np.mean(np.abs(y_true - y_pred))
-    
-    # R2 Score
-    ss_res = np.sum((y_true - y_pred)**2)
-    ss_tot = np.sum((y_true - np.mean(y_true))**2)
-    r2 = 1 - (ss_res / (ss_tot + 1e-8))
-    
-
     corr, _ = pearsonr(y_true, y_pred)
-    
-    return {"mse": mse, "mae": mae, "r2": r2, "corr": corr}
+    return {"mse": mse, "corr": corr}
 ####################################################################################################################################################
 ####################################################################################################################################################
 ####################################################################################################################################################
@@ -192,145 +209,133 @@ bins = {
     "discourse_bin3":    ["gpt2_layer_9", "gpt2_layer_10", "gpt2_layer_11", "gpt2_layer_12"]
 }
 
+# --- MAIN LOOP WITH PLOTTING ---
 for sub_id in SUB_IDs:
-    print(f"\n========== Processing subject: {sub_id} ==========\n")
-
     for bin_name in bins.keys():
-        print(f"\n--- Processing Bin: {bin_name} ---")
-
-        # Paths (Update these based on your file system)
-        # x_path = os.path.join(DATA_DIR, f"{SUB_ID}_node_features_X.pt")
+        print(f"\n--- Processing {bin_name} (Optimized) ---")
+        
+        # 1. Setup Data
         x_path = os.path.join(DATA_DIR, f"{sub_id}_node_features_X_FIR_stdPCA_{bin_name}.pt")
         raw_path = os.path.join(DATA_DIR, f"{sub_id}_combined.npy")
         adj_path = os.path.join(DATA_DIR, "fMRI_FC_results", f"{sub_id}_FC_thr0.5.npz")
-
-        # Load Dataset
+        
         dataset = BrainStateDataset(x_path, raw_path, adj_path, TRs_to_remove)
-    
-        # 3. Data Splits
+        
         total_len = len(dataset)
-        train_idx = int(total_len * 0.8)
-        val_idx   = int(total_len * 0.9)
+        train_idx, val_idx = int(total_len * 0.8), int(total_len * 0.9)
         
-        # Slicing datasets
-        train_dataset = dataset[:train_idx]
-        val_dataset   = dataset[train_idx:val_idx]
-        test_dataset  = dataset[val_idx:]
+        train_loader = DataLoader(dataset[:train_idx], batch_size=BATCH_SIZE, shuffle=False)
+        val_loader = DataLoader(dataset[train_idx:val_idx], batch_size=BATCH_SIZE, shuffle=False)
+        test_loader = DataLoader(dataset[val_idx:], batch_size=BATCH_SIZE, shuffle=False)
         
-        # Loaders
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-        val_loader   = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-        test_loader  = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-        
-        # 4. Initialize Model & Optimizer
+        # 2. Setup Model
         model = BrainGAT(in_channels=dataset.X.shape[2], out_channels=1).to(DEVICE)
-        optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-        criterion = nn.MSELoss()
-        # criterion = nn.HuberLoss(delta=1.0)
-        # Tracking
+        
+        optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.5, patience=5, verbose=True
+        )
+        criterion = NegativePearsonLoss()
+        
+        # 3. Training Loop
         best_val_corr = -1.0
+        model_save_path = os.path.join(SAVE_DIR, f"{sub_id}_{bin_name}_best.pth")
+        
+        # --- TRACKING HISTORY ---
         history = {'train_loss': [], 'val_loss': [], 'val_corr': []}
         
-        # Define Save Paths (Including BIN NAME)
-        model_save_path = os.path.join(SAVE_DIR, f"{sub_id}_{bin_name}_best_GAT_drop{DROPOUT}.pth")
-        
-        print(f"--- Starting Training for {bin_name} ---")
-        
         for epoch in range(EPOCHS):
-            # TRAIN
+            # Train
             model.train()
-            train_loss = 0
-            for batch in tqdm(train_loader, desc=f"Epoch {epoch+1} Train", leave=False):
+            train_loss_accum = 0
+            for batch in tqdm(train_loader, desc=f"Ep {epoch+1}", leave=False):
                 batch = batch.to(DEVICE)
                 optimizer.zero_grad()
-                out = model(batch) # Forward
-                loss = criterion(out, batch.y) # Compare vs Ground Truth
+                out = model(batch)
+                loss = criterion(out, batch.y)
                 loss.backward()
                 optimizer.step()
-                train_loss += loss.item()
+                train_loss_accum += loss.item()
             
-            avg_train_loss = train_loss / len(train_loader)
+            avg_train_loss = train_loss_accum / len(train_loader)
             
-            # VALIDATION
+            # Validation
             model.eval()
-            val_loss = 0
-            all_preds = []
-            all_trues = []
+            all_preds, all_trues = [], []
+            val_loss_accum = 0
             with torch.no_grad():
                 for batch in val_loader:
                     batch = batch.to(DEVICE)
                     out = model(batch)
+                    # Calc loss for tracking
                     loss = criterion(out, batch.y)
-                    val_loss += loss.item()
+                    val_loss_accum += loss.item()
                     
                     all_preds.append(out)
                     all_trues.append(batch.y)
-                    
-            avg_val_loss = val_loss / len(val_loader)
             
-            # Calculate Val Metrics
-            # Stack all validation outputs to compute metrics over the whole val set
-            val_preds_full = torch.cat(all_preds, dim=0)
-            val_trues_full = torch.cat(all_trues, dim=0)
-            metrics = compute_metrics(val_preds_full, val_trues_full)
+            avg_val_loss = val_loss_accum / len(val_loader)
+            metrics = compute_metrics(torch.cat(all_preds), torch.cat(all_trues))
             
+            # Update History
             history['train_loss'].append(avg_train_loss)
             history['val_loss'].append(avg_val_loss)
             history['val_corr'].append(metrics['corr'])
             
-            print(f"Epoch {epoch+1:02d} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Corr: {metrics['corr']:.4f}")
+            # Step Scheduler
+            scheduler.step(metrics['corr'])
             
-            # Checkpoint (Save best model)
+            print(f"Ep {epoch+1:02d} | Train Loss: {avg_train_loss:.4f} | Val Corr: {metrics['corr']:.4f}")
+            
             if metrics['corr'] > best_val_corr:
                 best_val_corr = metrics['corr']
                 torch.save(model.state_dict(), model_save_path)
-        # --- 5. FINAL EVALUATION ---
-        print(f"Loading best model for {bin_name}...")
+        
+        # 4. Final Evaluation
         model.load_state_dict(torch.load(model_save_path))
         model.eval()
-        
-        test_preds = []
-        test_trues = []
+        test_preds, test_trues = [], []
         with torch.no_grad():
             for batch in test_loader:
                 batch = batch.to(DEVICE)
-                out = model(batch)
-                test_preds.append(out)
+                test_preds.append(model(batch))
                 test_trues.append(batch.y)
         
-        test_preds = torch.cat(test_preds, dim=0)
-        test_trues = torch.cat(test_trues, dim=0)
+        # Inverse Transform
+        test_preds_np = torch.cat(test_preds).cpu().numpy().reshape(-1, dataset.Y.shape[1])
+        test_trues_np = torch.cat(test_trues).cpu().numpy().reshape(-1, dataset.Y.shape[1])
         
-        # INVERSE TRANSFORM (Scale back to original BOLD distribution)
-        test_preds_np = test_preds.cpu().numpy().reshape(-1, dataset.Y.shape[1])
-        test_trues_np = test_trues.cpu().numpy().reshape(-1, dataset.Y.shape[1])
+        preds_orig = dataset.scaler.inverse_transform(test_preds_np)
+        trues_orig = dataset.scaler.inverse_transform(test_trues_np)
         
-        test_preds_orig = dataset.scaler.inverse_transform(test_preds_np)
-        test_trues_orig = dataset.scaler.inverse_transform(test_trues_np)
+        final_metrics = compute_metrics(torch.tensor(preds_orig), torch.tensor(trues_orig))
+        print(f"--- FINAL {bin_name}: Corr {final_metrics['corr']:.4f} ---")
         
-        # Compute Final Metrics
-        final_metrics = compute_metrics(torch.tensor(test_preds_orig), torch.tensor(test_trues_orig))
-        final_metrics['bin'] = bin_name  # Add bin label
+        # 5. --- PLOTTING ---
+        plt.figure(figsize=(12, 5))
         
-        print(f"\n--- Final Test Results [{bin_name}] ---")
-        print(f"MSE: {final_metrics['mse']:.5f}")
-        print(f"Corr: {final_metrics['corr']:.4f}")
-        
-        # Save Metrics
-        df_metrics = pd.DataFrame([final_metrics])
-        csv_path = os.path.join(SAVE_DIR, f"{sub_id}_{bin_name}_test_metrics_drop{DROPOUT}.csv")
-        df_metrics.to_csv(csv_path, index=False)
-        
-        # Save Loss Curve
-        plt.figure(figsize=(10, 5))
-        plt.plot(history['train_loss'], label='Train Loss')
-        plt.plot(history['val_loss'], label='Val Loss')
-        plt.title(f'Loss Curve: {sub_id} - {bin_name}')
+        # Subplot 1: Loss
+        plt.subplot(1, 2, 1)
+        plt.plot(history['train_loss'], label='Train Loss (Neg Pearson)')
+        plt.plot(history['val_loss'], label='Val Loss (Neg Pearson)')
+        plt.title(f'{bin_name} - Loss')
+        plt.xlabel('Epochs')
+        plt.ylabel('Loss')
         plt.legend()
-        plt.savefig(os.path.join(SAVE_DIR, f"{sub_id}_{bin_name}_loss_curve_drop{DROPOUT}.png"))
-        plt.close() # Close plot to save memory
+        plt.grid(True)
         
-        print(f"Saved results for {bin_name}.\n")
-    
-    
+        # Subplot 2: Correlation
+        plt.subplot(1, 2, 2)
+        plt.plot(history['val_corr'], color='orange', label='Val Correlation')
+        plt.title(f'{bin_name} - Correlation')
+        plt.xlabel('Epochs')
+        plt.ylabel('Pearson r')
+        plt.legend()
+        plt.grid(True)
+        
+        # Save
+        plot_path = os.path.join(SAVE_DIR, f"{sub_id}_{bin_name}_training_plot.png")
+        plt.savefig(plot_path)
+        plt.close()
+        print(f"Plot saved to: {plot_path}")
     
